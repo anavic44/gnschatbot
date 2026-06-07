@@ -110,7 +110,7 @@ def generate_diagnosis(ticket):
                 "Verificar que el módem o router esté encendido.",
                 "Reiniciar el equipo durante 30 segundos.",
                 "Esperar a que las luces del módem estabilicen.",
-                "Realizar una prueba de ping simulada.",
+                "Ejecutar una prueba de ping real desde la VM del agente.",
                 "Si el problema persiste, escalar a soporte técnico."
             ]
         }
@@ -156,4 +156,192 @@ def build_escalation_payload(ticket, diagnosis):
             f"Motivo: {diagnosis.get('message')} "
             "Se recomienda asignar este caso a un ingeniero de soporte técnico humano."
         )
+    }
+
+import subprocess
+import ipaddress
+
+
+def is_valid_ip(value):
+    """
+    Valida si un valor tiene formato de IP.
+    """
+    try:
+        ipaddress.ip_address(str(value))
+        return True
+    except ValueError:
+        return False
+
+
+def get_target_ip_from_ticket(ticket):
+    """
+    Busca automáticamente una IP técnica asociada al ticket.
+    Si la API no proporciona IP del cliente o del equipo, regresa None.
+    """
+    possible_fields = [
+        "ip",
+        "ip_address",
+        "customer_ip",
+        "router_ip",
+        "onu_ip",
+        "device_ip",
+        "public_ip",
+        "management_ip",
+        "ipAddress",
+        "customerIp",
+        "routerIp",
+        "onuIp",
+        "deviceIp",
+        "publicIp",
+        "managementIp"
+    ]
+
+    for field in possible_fields:
+        value = ticket.get(field)
+        if value and is_valid_ip(value):
+            return str(value)
+
+    return None
+
+
+def run_ping_test(host="8.8.8.8", count=4):
+    """
+    Ejecuta una prueba de ping real desde la VM hacia el host indicado.
+    El host puede ser una IP del cliente si la API la proporciona.
+    """
+    try:
+        result = subprocess.run(
+            ["ping", "-c", str(count), host],
+            capture_output=True,
+            text=True,
+            timeout=15
+        )
+
+        success = result.returncode == 0
+
+        return {
+            "host": host,
+            "success": success,
+            "return_code": result.returncode,
+            "stdout": result.stdout,
+            "stderr": result.stderr
+        }
+
+    except Exception as error:
+        return {
+            "host": host,
+            "success": False,
+            "error": str(error)
+        }
+def classify_free_text_problem(description):
+    """
+    Clasifica un problema cuando el cliente no tiene número de ticket.
+    Usa lenguaje escrito libremente por el cliente.
+    """
+    description = str(description).lower()
+
+    escalation_keywords = [
+        "sin internet",
+        "no tengo internet",
+        "sin servicio",
+        "no tengo servicio",
+        "luz roja",
+        "rojo",
+        "no prende",
+        "no funciona",
+        "sin señal",
+        "falta de señal",
+        "fibra",
+        "cable cortado",
+        "poste",
+        "corte",
+        "ya reinicié",
+        "ya reinicie",
+        "reinicié y sigue",
+        "reinicie y sigue"
+    ]
+
+    remote_keywords = [
+        "lento",
+        "lenta",
+        "lentitud",
+        "velocidad",
+        "intermitente",
+        "intermitencia",
+        "se va y viene",
+        "se corta",
+        "tarda",
+        "ping alto",
+        "lag",
+        "no carga",
+        "wifi lento"
+    ]
+
+    support_keywords = [
+        "cambiar plan",
+        "cambio de plan",
+        "contraseña",
+        "password",
+        "pagar",
+        "pago",
+        "cobranza",
+        "factura",
+        "cancelar",
+        "cancelación",
+        "domicilio",
+        "cambio de domicilio"
+    ]
+
+    if any(word in description for word in escalation_keywords):
+        return {
+            "decision": "ESCALAR_TECNICO",
+            "category": "Falla crítica reportada por cliente",
+            "message": (
+                "Por lo que describes, tu servicio podría requerir revisión técnica. "
+                "Evitaré pedirte que repitas pasos básicos si ya hay señales de falta de señal o falla física."
+            )
+        }
+
+    if any(word in description for word in remote_keywords):
+        return {
+            "decision": "DIAGNOSTICO_REMOTO",
+            "category": "Posible lentitud o intermitencia",
+            "message": (
+                "Parece que tu servicio está lento o intermitente. "
+                "Vamos a intentar una revisión básica antes de enviarlo con un técnico."
+            )
+        }
+
+    if any(word in description for word in support_keywords):
+        return {
+            "decision": "REVISION_SOPORTE",
+            "category": "Solicitud administrativa o de soporte",
+            "message": (
+                "Esto parece una solicitud de atención o cambio administrativo. "
+                "Lo mejor es canalizarlo con soporte para que revisen tu cuenta."
+            )
+        }
+
+    return {
+        "decision": "REVISION_SOPORTE",
+        "category": "Caso no clasificado automáticamente",
+        "message": (
+            "No tengo suficiente información para clasificar el problema con seguridad. "
+            "Te canalizaré a soporte para que revisen tu caso."
+        )
+    }
+
+
+def build_ticketless_escalation_payload(description, classification):
+    """
+    Crea un comentario general para evidenciar la intención de escalamiento cuando no hay folio.
+    Nota: la API de comentarios requiere idTicket, por eso no se puede hacer POST real
+    sin un ticket existente.
+    """
+    return {
+        "description": description,
+        "decision": classification.get("decision"),
+        "category": classification.get("category"),
+        "reason": classification.get("message"),
+        "source": "gns-chatbot-agent"
     }
