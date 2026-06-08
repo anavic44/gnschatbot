@@ -1,1241 +1,770 @@
-
 import os
-
 import re
-
 import json
-
 from datetime import datetime
-
 from pathlib import Path
 
 from flask import Flask, request, jsonify, render_template_string
-
 from dotenv import load_dotenv
 
-from gns_api import get_tickets, get_categories, post_escalation
-
-from agent import (
-
-    find_ticket_by_number,
-
-    generate_diagnosis,
-
-    build_escalation_payload,
-
-    sanitize_ticket,
-
-    run_ping_test,
-
-    get_target_ip_from_ticket,
-
-    classify_free_text_problem,
-
-    build_ticketless_escalation_payload,
-
+from gns_api import (
+    get_customer_by_id,
+    get_customer_balance,
+    get_customer_services,
+    get_tickets_by_customer,
+    get_categories,
+    create_ticket_for_customer,
+    select_category_id,
 )
-
+from agent import run_ping_test, classify_free_text_problem
+from ai_client import generate_customer_response
 from logger_config import logger
 
-from ai_client import generate_customer_response
 
 load_dotenv()
-
 app = Flask(__name__)
 
+
 HTML = """
-
 <!DOCTYPE html>
-
 <html lang="es">
-
 <head>
-
     <meta charset="UTF-8">
-
     <title>GNS WhatsApp Chatbot</title>
-
     <style>
-
         body {
-
             margin: 0;
-
             font-family: Arial, sans-serif;
-
             background: #0f172a;
-
             color: #111827;
-
         }
-
         .phone {
-
-            max-width: 430px;
-
+            max-width: 460px;
             margin: 30px auto;
-
             background: #e5ddd5;
-
             border-radius: 24px;
-
             overflow: hidden;
-
             box-shadow: 0 20px 50px rgba(0,0,0,0.45);
-
         }
-
         .header {
-
             background: #075e54;
-
             color: white;
-
             padding: 18px;
-
             display: flex;
-
             align-items: center;
-
             gap: 12px;
-
         }
-
         .avatar {
-
             width: 42px;
-
             height: 42px;
-
             background: #10b981;
-
             border-radius: 50%;
-
             display: flex;
-
             align-items: center;
-
             justify-content: center;
-
             font-weight: bold;
-
         }
-
         .header-text h1 {
-
             font-size: 18px;
-
             margin: 0;
-
         }
-
         .header-text p {
-
             margin: 2px 0 0;
-
             font-size: 12px;
-
             color: #d1fae5;
-
         }
-
         .chat {
-
             padding: 16px;
-
-            min-height: 520px;
-
+            min-height: 540px;
             background: #e5ddd5;
-
         }
-
         .bubble {
-
-            max-width: 85%;
-
+            max-width: 88%;
             padding: 12px 14px;
-
             border-radius: 12px;
-
             margin: 10px 0;
-
             line-height: 1.45;
-
             font-size: 14px;
-
             white-space: pre-line;
-
         }
-
         .bot {
-
             background: #ffffff;
-
             border-top-left-radius: 2px;
-
             color: #111827;
-
         }
-
         .user {
-
             background: #dcf8c6;
-
             border-top-right-radius: 2px;
-
             margin-left: auto;
-
             color: #111827;
-
         }
-
         .quick-buttons {
-
             display: grid;
-
             grid-template-columns: 1fr 1fr;
-
             gap: 8px;
-
             margin: 14px 0;
-
         }
-
         .quick-buttons button {
-
             border: none;
-
             background: #ffffff;
-
             color: #075e54;
-
             padding: 10px;
-
             border-radius: 999px;
-
             font-weight: bold;
-
             cursor: pointer;
-
             box-shadow: 0 2px 4px rgba(0,0,0,0.12);
-
         }
-
         .quick-buttons button:hover {
-
             background: #f0fdf4;
-
         }
-
         .quick-buttons .menu-button {
-
             grid-column: 1 / -1;
-
             background: #075e54;
-
             color: white;
-
         }
-
         form {
-
             background: #f0f2f5;
-
             padding: 12px;
-
             display: flex;
-
             gap: 8px;
-
             align-items: center;
-
         }
-
         input {
-
             flex: 1;
-
             border: none;
-
             border-radius: 999px;
-
             padding: 13px 16px;
-
             font-size: 14px;
-
             outline: none;
-
         }
-
         .send {
-
             width: 46px;
-
             height: 46px;
-
             border-radius: 50%;
-
             border: none;
-
             background: #25d366;
-
             color: white;
-
             font-size: 18px;
-
             cursor: pointer;
-
         }
-
         details {
-
             margin-top: 14px;
-
             background: rgba(255,255,255,0.86);
-
             padding: 10px;
-
             border-radius: 10px;
-
             font-size: 12px;
-
         }
-
         pre {
-
             white-space: pre-wrap;
-
             overflow-x: auto;
-
             color: #111827;
-
         }
-
         .meta {
-
             font-size: 11px;
-
             color: #64748b;
-
             margin-top: 6px;
-
         }
-
     </style>
-
 </head>
-
 <body>
-
     <div class="phone">
-
         <div class="header">
-
             <div class="avatar">G</div>
-
             <div class="header-text">
-
                 <h1>Soporte GNS</h1>
-
                 <p>Agente virtual en línea</p>
-
             </div>
-
         </div>
 
         <div class="chat">
-
-            <div class="bubble bot">
-
+            {% if not show_menu %}
+                <div class="bubble bot">
 Hola 👋 Soy el asistente virtual de GNS.
 
-Puedes escribirme tu número de ticket, id de ticket o describir tu problema.
+Para comenzar, necesito validar tu cliente.
+Escribe tu ID así:
 
-Ejemplos:
+cliente 170
 
-• mi internet está muy lento
-
-• tengo luz roja en el módem
-
-• TCK390236
-
-• Consultar ticket 1208
-
-• quiero cambiar mi plan
-
-            </div>
-
-            <div class="quick-buttons">
-
-                <button type="button" onclick="setQuick('Consultar ticket TCK390236')">Consultar TCK</button>
-
-                <button type="button" onclick="setQuick('Consultar ticket 1208')">Consultar ID</button>
-
-                <button type="button" onclick="setQuick('mi internet está muy lento y se va y viene')">Internet lento</button>
-
-                <button type="button" onclick="setQuick('tengo luz roja en el módem y no tengo internet')">Luz roja</button>
-
-                <button type="button" onclick="setQuick('ejecutar prueba de conexión')">Prueba conexión</button>
-
-                <button type="button" onclick="setQuick('quiero escalar el ticket TCK390236 a técnico')">Escalar técnico</button>
-
-                <button type="button" onclick="setQuick('quiero cambiar mi plan')">Cambio de plan</button>
-
-                <button type="button" onclick="setQuick('quiero hablar con soporte')">Soporte</button>
-
-                <button type="button" class="menu-button" onclick="window.location.href='/'">Volver al menú</button>
-
-            </div>
+Después de validarte podré mostrar tu estado de pago, servicio, tickets activos y menú de soporte.
+                </div>
+            {% endif %}
 
             {% if user_message %}
-
                 <div class="bubble user">{{ user_message }}</div>
-
             {% endif %}
 
             {% if bot_message %}
-
                 <div class="bubble bot">
-
 {{ bot_message }}
-
                     <div class="meta">Registrado en logs/agent.log</div>
-
                 </div>
+            {% endif %}
 
+            {% if show_menu %}
+                <div class="quick-buttons">
+                    <button type="button" onclick="setQuick('ver tickets activos')">Tickets activos</button>
+                    <button type="button" onclick="setQuick('consultar saldo')">Estado de pago</button>
+                    <button type="button" onclick="setQuick('tengo luz roja en el módem y no tengo internet')">Luz roja</button>
+                    <button type="button" onclick="setQuick('fibra o cable cortado')">Fibra/cable cortado</button>
+                    <button type="button" onclick="setQuick('mi internet está lento')">Internet lento</button>
+                    <button type="button" onclick="setQuick('quiero cambiar mi plan')">Administrativo</button>
+                    <button type="button" onclick="setQuick('no funcionó')">No funcionó</button>
+                    <button type="button" onclick="setQuick('sí funcionó')">Sí funcionó</button>
+                    <button type="button" class="menu-button" onclick="window.location.href='/'">Volver al menú principal</button>
+                </div>
+            {% else %}
+                <div class="quick-buttons">
+                    <button type="button" class="menu-button" onclick="setQuick('cliente ')">Validar cliente</button>
+                </div>
             {% endif %}
 
             {% if result %}
-
                 <details>
-
                     <summary>Ver detalle técnico</summary>
-
                     <pre>{{ result }}</pre>
-
                 </details>
-
             {% endif %}
-
         </div>
 
         <form method="POST" action="/whatsapp">
-
             <input id="message" name="message" placeholder="Escribe tu mensaje..." required>
-
             <button class="send" type="submit">➤</button>
-
         </form>
-
     </div>
 
     <script>
-
         function setQuick(text) {
-
-            document.getElementById("message").value = text;
-
+            const input = document.getElementById("message");
+            input.value = text;
+            input.focus();
+            input.setSelectionRange(input.value.length, input.value.length);
         }
-
     </script>
-
 </body>
-
 </html>
-
 """
 
-def extract_ticket_identifier(message):
 
-    text = str(message).upper()
+CRITICAL_KEYWORDS = [
+    "fibra",
+    "cable cortado",
+    "cable roto",
+    "luz roja",
+    "sin internet",
+    "no tengo internet",
+    "sin servicio",
+    "no tengo servicio",
+    "sin señal",
+    "falta de señal",
+    "poste",
+    "corte total",
+]
 
-    tck_match = re.search(r"TCK\d+", text)
+ADMIN_KEYWORDS = [
+    "pago",
+    "saldo",
+    "factura",
+    "cambiar plan",
+    "cambio de plan",
+    "cancelar",
+    "cancelación",
+    "contraseña",
+    "password",
+    "domicilio",
+    "administrativo",
+]
 
-    if tck_match:
+REMOTE_KEYWORDS = [
+    "lento",
+    "lenta",
+    "lentitud",
+    "intermitente",
+    "intermitencia",
+    "se va y viene",
+    "velocidad",
+    "lag",
+    "no carga",
+]
 
-        return {"type": "ticket_number", "value": tck_match.group(0)}
 
-    numeric_match = re.search(r"(?:TICKET|IDTICKET|ID|FOLIO)?\s*#?\s*(\d{2,6})", text)
-
-    if numeric_match:
-
-        return {"type": "idTicket", "value": int(numeric_match.group(1))}
-
-    return {"type": None, "value": None}
-
-def infer_option_from_message(message, has_ticket=False):
-
+def extract_customer_id(message):
     text = str(message).lower()
+    match = re.search(r"(?:cliente|idcustomer|id cliente|cliente id)\s*#?\s*(\d+)", text)
+    if match:
+        return int(match.group(1))
+    return None
 
-    if "ping" in text or "prueba" in text or "conexión" in text or "conexion" in text:
 
-        return "4"
+def read_session_customer():
+    path = Path("data/session_customer.json")
+    if not path.exists():
+        return None
 
-    if (
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return None
 
-        "escalar" in text
 
-        or "técnico" in text
+def save_session_customer(customer):
+    Path("data").mkdir(exist_ok=True)
 
-        or "tecnico" in text
+    safe_customer = {
+        "idCustomer": customer.get("idCustomer"),
+        "active": customer.get("active"),
+        "payment_status": customer.get("payment_status"),
+        "city": customer.get("city"),
+        "state": customer.get("state"),
+    }
 
-        or "luz roja" in text
+    Path("data/session_customer.json").write_text(
+        json.dumps(safe_customer, ensure_ascii=False, indent=2)
+    )
 
-        or "sin internet" in text
+    return safe_customer
 
-        or "no tengo internet" in text
 
-    ):
+def clear_session_customer():
+    path = Path("data/session_customer.json")
+    if path.exists():
+        path.unlink()
 
-        return "5"
 
-    if (
+def should_show_menu(result):
+    if not isinstance(result, dict):
+        return False
 
-        "soporte" in text
+    return result.get("mode") not in [
+        "requires_customer_validation",
+        "main_menu_reset",
+    ]
 
-        or "hablar" in text
 
-        or "plan" in text
+def payment_status_label(value):
+    if str(value) == "1":
+        return "al corriente o habilitado"
+    if str(value) == "0":
+        return "pendiente o no confirmado"
+    return "no disponible"
 
-        or "pago" in text
 
-        or "contraseña" in text
+def active_tickets(tickets):
+    if not isinstance(tickets, list):
+        return []
 
-        or "password" in text
+    return [ticket for ticket in tickets if str(ticket.get("status", "")).lower() == "abierto"]
 
-        or "cambiar" in text
 
-        or "cambio" in text
+def summarize_tickets(tickets, limit=5):
+    if not tickets:
+        return "No encontré tickets activos."
 
-    ):
+    lines = []
 
-        return "6"
+    for ticket in tickets[:limit]:
+        lines.append(
+            f"• {ticket.get('ticket_number')} | {ticket.get('category')} | {ticket.get('status')}"
+        )
 
-    if has_ticket or "ticket" in text or "folio" in text or "consultar" in text:
+    if len(tickets) > limit:
+        lines.append(f"• Y {len(tickets) - limit} ticket(s) más.")
 
-        return "1"
+    return "\n".join(lines)
 
-    return "2"
 
-def get_ticket_or_none(ticket_identifier):
+def summarize_service(services):
+    if isinstance(services, dict):
+        services = [services]
 
-    if not ticket_identifier or not ticket_identifier.get("value"):
+    if not isinstance(services, list) or not services:
+        return "No encontré servicio activo."
 
-        return None, None
+    service = services[0]
+    package = service.get("package") or "paquete no disponible"
+    status = service.get("status") or "estado no disponible"
 
-    tickets, status_code = get_tickets()
+    return f"{package} | {status}"
 
-    logger.info(f"API_CALL | GET tickets | HTTP={status_code}")
 
-    identifier_type = ticket_identifier.get("type")
-
-    identifier_value = ticket_identifier.get("value")
-
-    ticket = None
-
-    if identifier_type == "ticket_number":
-
-        ticket = find_ticket_by_number(tickets, identifier_value)
-
-    elif identifier_type == "idTicket":
-
-        for item in tickets:
-
-            try:
-
-                if int(item.get("idTicket")) == int(identifier_value):
-
-                    ticket = item
-
-                    break
-
-            except (TypeError, ValueError):
-
-                continue
-
-    if not ticket:
-
-        logger.warning(f"TICKET_NOT_FOUND | type={identifier_type} | value={identifier_value}")
-
-        return None, {
-
-            "error": "Ticket no encontrado",
-
-            "ticket_identifier": ticket_identifier,
-
-        }
-
-    return ticket, None
-
-def apply_ai_if_safe(conversation, context, allow_ai=True):
-
-    if not allow_ai:
-
-        return conversation
-
-    return generate_customer_response(conversation, context)
-
-def save_local_modification(modification_type, description, ticket=None, extra=None):
-
+def save_local_modification(modification_type, description, customer=None, ticket=None, extra=None):
     Path("data").mkdir(exist_ok=True)
 
     record = {
-
         "created_at": datetime.utcnow().isoformat() + "Z",
-
         "modification_type": modification_type,
-
         "description": description,
-
         "source": "gns-whatsapp-chatbot",
-
-        "ticket": {
-
-            "idTicket": ticket.get("idTicket") if ticket else None,
-
-            "ticket_number": ticket.get("ticket_number") if ticket else None,
-
-            "category": ticket.get("category") if ticket else None,
-
-            "status": ticket.get("status") if ticket else None,
-
+        "customer": {
+            "idCustomer": customer.get("idCustomer") if customer else None,
         },
-
+        "ticket": ticket or {},
         "extra": extra or {},
-
     }
 
     with open("data/local_modifications.jsonl", "a", encoding="utf-8") as file:
-
         file.write(json.dumps(record, ensure_ascii=False) + "\n")
 
     logger.info(
-
         f"LOCAL_MODIFICATION | type={modification_type} | "
-
-        f"ticket={record['ticket']['ticket_number']} | "
-
-        f"idTicket={record['ticket']['idTicket']}"
-
+        f"idCustomer={record['customer']['idCustomer']}"
     )
 
     return record
 
-def build_ticket_based_response(option, ticket):
 
-    diagnosis = generate_diagnosis(ticket)
-
-    safe_ticket = sanitize_ticket(ticket)
-
-    ticket_number = ticket.get("ticket_number")
-
-    id_ticket = ticket.get("idTicket")
-
-    status = ticket.get("status")
-
-    category = ticket.get("category")
-
-    response_payload = {
-
-        "mode": "ticket",
-
-        "safe_ticket": safe_ticket,
-
-        "diagnosis": diagnosis,
-
-    }
-
-    allow_ai = True
-
-    if option == "1":
-
-        conversation = (
-
-            f"Encontré tu ticket {ticket_number}.\n"
-
-            f"ID interno: {id_ticket}.\n"
-
-            f"Estado: {status}.\n"
-
-            f"Tipo de reporte: {category}.\n\n"
-
-            "Si el problema sigue, puedo ayudarte con una revisión básica o canalizarlo a soporte."
-
-        )
-
-    elif option == "2":
-
-        if diagnosis["decision"] == "DIAGNOSTICO_REMOTO":
-
-            conversation = (
-
-                "Parece un problema de velocidad o intermitencia.\n\n"
-
-                "Vamos paso a paso:\n"
-
-                "1. Revisa que el módem esté encendido.\n"
-
-                "2. Confirma que las luces estén estables.\n"
-
-                "3. Reinícialo durante 30 segundos.\n"
-
-                "4. Si sigue igual, podemos hacer una prueba de conexión."
-
-            )
-
-        elif diagnosis["decision"] == "ESCALAR_TECNICO":
-
-            conversation = (
-
-                "Por la información de tu ticket, esto puede requerir revisión técnica.\n\n"
-
-                "No te pediré repetir reinicios si ya hay señales de falta de señal, luz roja o corte."
-
-            )
-
-        else:
-
-            conversation = (
-
-                "Tu ticket parece requerir revisión de soporte.\n"
-
-                "Te recomiendo continuar con un agente para validar los detalles."
-
-            )
-
-    elif option == "3":
-
-        conversation = (
-
-            "Vamos a intentar un reinicio seguro.\n\n"
-
-            "1. Desconecta el módem o router durante 30 segundos.\n"
-
-            "2. Vuelve a conectarlo.\n"
-
-            "3. Espera a que las luces se estabilicen.\n\n"
-
-            "Si el problema sigue, podemos hacer una prueba de conexión o escalar el caso."
-
-        )
-
-    elif option == "4":
-
-        target_ip = get_target_ip_from_ticket(ticket)
-
-        if target_ip:
-
-            ping_result = run_ping_test(target_ip, 4)
-
-            ping_source = "IP técnica asociada al ticket"
-
-        else:
-
-            ping_result = run_ping_test("8.8.8.8", 4)
-
-            ping_source = "destino externo de referencia porque la API no proporciona IP técnica del cliente"
-
-        response_payload["ping_test"] = ping_result
-
-        response_payload["ping_source"] = ping_source
-
-        if ping_result.get("success"):
-
-            conversation = (
-
-                "La prueba de conexión respondió correctamente ✅\n\n"
-
-                "Esto confirma que el agente tiene salida a Internet. "
-
-                "Como la API no proporciona la IP técnica de tu equipo, esta prueba se usa como referencia general."
-
-            )
-
-        else:
-
-            conversation = (
-
-                "La prueba de conexión falló.\n"
-
-                "Si tu reporte incluye falta de señal, luz roja o corte, se recomienda revisión técnica."
-
-            )
-
-        logger.info(
-
-            f"PING_TEST | ticket={ticket_number} | host={ping_result.get('host')} | "
-
-            f"success={ping_result.get('success')} | source={ping_source}"
-
-        )
-
-        allow_ai = False
-
-    elif option == "5":
-
-        escalation_payload = build_escalation_payload(ticket, diagnosis)
-
-        escalation_response, escalation_status = post_escalation(escalation_payload)
-
-        logger.info(
-
-            f"API_CALL | POST escalation | ticket={ticket_number} | "
-
-            f"HTTP={escalation_status} | payload={escalation_payload}"
-
-        )
-
-        response_payload["escalation"] = {
-
-            "http_status": escalation_status,
-
-            "payload_sent": escalation_payload,
-
-            "api_response": escalation_response,
-
-        }
-
-        if escalation_status in [200, 201]:
-
-            conversation = (
-
-                f"Listo ✅ Registré una nota de escalamiento en el ticket {ticket_number}.\n"
-
-                "Un integrante del equipo técnico deberá revisar el caso."
-
-            )
-
-        else:
-
-            conversation = (
-
-                f"Intenté registrar el escalamiento, pero la API respondió con código {escalation_status}. "
-
-                "El evento quedó registrado en logs."
-
-            )
-
-        allow_ai = False
-
-    elif option == "6":
-
-        local_modification = save_local_modification(
-
-            "support_request",
-
-            "Solicitud de soporte general o trámite administrativo.",
-
-            ticket=ticket,
-
-            extra={"category": category, "status": status},
-
-        )
-
-        response_payload["local_modification"] = local_modification
-
-        conversation = (
-
-            "Listo ✅ Registré una solicitud local de soporte para seguimiento.\n"
-
-            "Esto no modifica el dataset original ni el ticket en la API, pero deja evidencia de la solicitud."
-
-        )
-
-        allow_ai = False
-
-    else:
-
-        conversation = "No reconocí esa opción. Escribe tu problema o usa un botón rápido."
-
-    logger.info(
-
-        f"WHATSAPP_FLOW | mode=ticket | ticket={ticket_number} | option={option} | "
-
-        f"category={category} | decision={diagnosis.get('decision')}"
-
-    )
-
-    conversation = apply_ai_if_safe(
-
-        conversation,
-
-        {
-
-            "mode": "ticket",
-
-            "ticket_number": ticket_number,
-
-            "idTicket": id_ticket,
-
-            "category": category,
-
-            "decision": diagnosis.get("decision"),
-
-        },
-
-        allow_ai=allow_ai,
-
-    )
-
-    return conversation, response_payload
-
-def build_ticketless_response(option, description):
-
-    classification = classify_free_text_problem(description)
-
-    response_payload = {
-
-        "mode": "no_ticket",
-
-        "description": description,
-
-        "classification": classification,
-
-    }
-
-    decision = classification.get("decision")
-
-    allow_ai = True
-
-    if option == "4":
-
-        ping_result = run_ping_test("8.8.8.8", 4)
-
-        response_payload["ping_test"] = ping_result
-
-        response_payload["ping_source"] = (
-
-            "destino externo de referencia porque no hay ticket ni IP técnica del cliente"
-
-        )
-
-        if ping_result.get("success"):
-
-            conversation = (
-
-                "La prueba de conexión desde el agente respondió correctamente ✅\n\n"
-
-                "Esto valida la salida a Internet de la VM del agente, no directamente tu módem. "
-
-                "Para revisar tu servicio específico necesito un ticket o información técnica adicional."
-
-            )
-
-        else:
-
-            conversation = "La prueba de conexión desde el agente falló. Te recomiendo contactar soporte."
-
-        logger.info(
-
-            f"PING_TEST | mode=no_ticket | host={ping_result.get('host')} | "
-
-            f"success={ping_result.get('success')}"
-
-        )
-
-        allow_ai = False
-
-    elif option == "5":
-
-        if decision == "ESCALAR_TECNICO":
-
-            escalation_payload = build_ticketless_escalation_payload(description, classification)
-
-            response_payload["escalation_intent"] = escalation_payload
-
-            conversation = (
-
-                "Por lo que describes, podría requerirse revisión técnica.\n\n"
-
-                "Como no tengo un número de ticket, no puedo registrar el escalamiento directamente en la API. "
-
-                "Te recomiendo levantar un ticket o compartir tu folio para registrar la escalación."
-
-            )
-
-        else:
-
-            conversation = (
-
-                "Con la información proporcionada, primero recomiendo una revisión básica o contactar soporte. "
-
-                "Si hay luz roja, falta de señal o corte total, solicita revisión técnica."
-
-            )
-
-        allow_ai = False
-
-    elif option == "6":
-
-        local_modification = save_local_modification(
-
-            "support_request_no_ticket",
-
-            description,
-
-            ticket=None,
-
-            extra={"classification": classification},
-
-        )
-
-        response_payload["local_modification"] = local_modification
-
-        conversation = (
-
-            "Listo ✅ Registré una solicitud local de soporte.\n"
-
-            "Como no tengo número de ticket, no se modificó la API ni el dataset original."
-
-        )
-
-        allow_ai = False
-
-    elif decision == "DIAGNOSTICO_REMOTO":
-
-        conversation = (
-
-            "Parece que tu servicio está lento o intermitente.\n\n"
-
-            "Probemos primero esto:\n"
-
-            "1. Revisa que el módem esté encendido.\n"
-
-            "2. Confirma que las luces estén estables.\n"
-
-            "3. Reinícialo durante 30 segundos.\n\n"
-
-            "Si sigue igual, conviene levantar o escalar un reporte."
-
-        )
-
-    elif decision == "ESCALAR_TECNICO":
-
-        conversation = (
-
-            "Por lo que describes, puede ser necesaria una revisión técnica.\n\n"
-
-            "Si ves luz roja, no tienes señal o ya reiniciaste varias veces sin mejora, lo mejor es levantar un ticket."
-
-        )
-
-        allow_ai = False
-
-    else:
-
-        conversation = (
-
-            "Esto parece requerir revisión de soporte.\n"
-
-            "Te recomiendo compartir más detalles o contactar a un agente."
-
-        )
-
-    logger.info(
-
-        f"WHATSAPP_FLOW | mode=no_ticket | option={option} | "
-
-        f"decision={classification.get('decision')} | category={classification.get('category')}"
-
-    )
-
-    conversation = apply_ai_if_safe(
-
-        conversation,
-
-        {
-
-            "mode": "no_ticket",
-
-            "description": description,
-
-            "decision": classification.get("decision"),
-
-            "category": classification.get("category"),
-
-        },
-
-        allow_ai=allow_ai,
-
-    )
-
-    return conversation, response_payload
-
-@app.route("/", methods=["GET"])
-
-def home():
-
-    return render_template_string(
-
-        HTML,
-
-        user_message=None,
-
-        bot_message=None,
-
-        result=None,
-
-    )
-
-@app.route("/whatsapp", methods=["POST"])
-
-def whatsapp():
-
-    message = request.form.get("message", "").strip()
-
-    ticket_identifier = extract_ticket_identifier(message)
-
-    option = infer_option_from_message(message, has_ticket=bool(ticket_identifier.get("value")))
-
-    ticket, error = get_ticket_or_none(ticket_identifier)
-
-    if error:
-
-        bot_message, response_payload = build_ticketless_response(option, message)
-
-        response_payload["ticket_lookup_error"] = error
-
-    elif ticket:
-
-        bot_message, response_payload = build_ticket_based_response(option, ticket)
-
-    else:
-
-        bot_message, response_payload = build_ticketless_response(option, message)
-
-    return render_template_string(
-
-        HTML,
-
-        user_message=message,
-
-        bot_message=bot_message,
-
-        result=json.dumps(response_payload, indent=4, ensure_ascii=False),
-
-    )
-
-@app.route("/api/whatsapp", methods=["POST"])
-
-def api_whatsapp():
-
-    data = request.get_json() or {}
-
-    message = data.get("message", "").strip()
-
-    ticket_identifier = extract_ticket_identifier(message)
-
-    option = infer_option_from_message(message, has_ticket=bool(ticket_identifier.get("value")))
-
-    ticket, error = get_ticket_or_none(ticket_identifier)
-
-    if error:
-
-        bot_message, response_payload = build_ticketless_response(option, message)
-
-        response_payload["ticket_lookup_error"] = error
-
-    elif ticket:
-
-        bot_message, response_payload = build_ticket_based_response(option, ticket)
-
-    else:
-
-        bot_message, response_payload = build_ticketless_response(option, message)
-
-    return jsonify(
-
-        {
-
-            "message": message,
-
-            "inferred_option": option,
-
-            "ticket_identifier": ticket_identifier,
-
-            "chatbot_message": bot_message,
-
-            "technical_detail": response_payload,
-
-        }
-
-    )
-
-@app.route("/health", methods=["GET"])
-
-def health():
-
-    return jsonify({"status": "ok", "service": "gns-whatsapp-chatbot"})
-
-@app.route("/api/chatbot", methods=["POST"])
-
-def api_chatbot():
-
-    data = request.get_json() or {}
-
-    message = data.get("message") or data.get("description") or data.get("ticket_number") or ""
-
-    ticket_identifier = extract_ticket_identifier(message)
-
-    option = str(
-
-        data.get("option")
-
-        or infer_option_from_message(message, has_ticket=bool(ticket_identifier.get("value")))
-
-    )
-
-    ticket, error = get_ticket_or_none(ticket_identifier)
-
-    if error:
-
-        bot_message, response_payload = build_ticketless_response(option, message)
-
-        response_payload["ticket_lookup_error"] = error
-
-    elif ticket:
-
-        bot_message, response_payload = build_ticket_based_response(option, ticket)
-
-    else:
-
-        bot_message, response_payload = build_ticketless_response(option, message)
-
-    return jsonify({"chatbot_message": bot_message, "technical_detail": response_payload})
-
-@app.route("/api/summary", methods=["GET"])
-
-def api_summary():
-
-    tickets, tickets_status = get_tickets()
-
+def create_support_ticket(id_customer, problem_type, problem_text):
     categories, categories_status = get_categories()
 
-    logger.info(f"API_CALL | GET tickets | HTTP={tickets_status}")
+    if problem_type == "critical":
+        id_category = select_category_id(
+            categories,
+            ["problemas de corte", "corte", "intermitencia", "soporte general"],
+            fallback_id=6,
+        )
+    elif problem_type == "administrative":
+        id_category = select_category_id(
+            categories,
+            ["soporte general", "cobranza", "cambio de plan", "cancelación"],
+            fallback_id=1,
+        )
+    elif problem_type == "remote":
+        id_category = select_category_id(
+            categories,
+            ["problemas de velocidad", "intermitencia", "soporte general"],
+            fallback_id=7,
+        )
+    else:
+        id_category = select_category_id(categories, ["soporte general"], fallback_id=1)
 
-    logger.info(f"API_CALL | GET categories | HTTP={categories_status}")
-
-    open_tickets = [t for t in tickets if str(t.get("status")).lower() == "abierto"]
-
-    return jsonify(
-
-        {
-
-            "total_tickets": len(tickets),
-
-            "open_tickets": len(open_tickets),
-
-            "categories_available": len(categories),
-
-            "status": "summary_generated",
-
-        }
-
+    ticket_response, ticket_status = create_ticket_for_customer(
+        id_customer=id_customer,
+        id_category=id_category,
+        problem=problem_text,
     )
 
+    logger.info(
+        f"CREATE_TICKET | idCustomer={id_customer} | type={problem_type} | "
+        f"idCategory={id_category} | HTTP={ticket_status}"
+    )
+
+    return {
+        "http_status": ticket_status,
+        "idCategory": id_category,
+        "api_response": ticket_response,
+        "categories_status": categories_status,
+    }
+
+
+def use_ai_for_noncritical(message, context):
+    return generate_customer_response(message, context)
+
+
+def validate_customer_flow(id_customer):
+    customer, customer_status = get_customer_by_id(id_customer)
+
+    if customer_status not in [200, 201] or not isinstance(customer, dict):
+        return (
+            "No encontré ese cliente. Por favor verifica el ID e intenta de nuevo.",
+            {
+                "mode": "requires_customer_validation",
+                "customer_status": customer_status,
+                "customer_response": customer,
+            },
+        )
+
+    save_session_customer(customer)
+
+    balance, balance_status = get_customer_balance(id_customer)
+    services, services_status = get_customer_services(id_customer)
+    tickets, tickets_status = get_tickets_by_customer(id_customer)
+    open_tickets = active_tickets(tickets)
+
+    service_summary = summarize_service(services)
+    tickets_summary = summarize_tickets(open_tickets)
+    payment_label = payment_status_label(customer.get("payment_status"))
+
+    bot_message = (
+        f"Cliente validado ✅\n\n"
+        f"Estado de pago: {payment_label}.\n"
+        f"Servicio: {service_summary}.\n\n"
+        f"Tickets activos:\n{tickets_summary}"
+    )
+
+    result = {
+        "mode": "customer_validated",
+        "safe_customer": {
+            "idCustomer": customer.get("idCustomer"),
+            "active": customer.get("active"),
+            "payment_status": customer.get("payment_status"),
+            "city": customer.get("city"),
+            "state": customer.get("state"),
+        },
+        "balance_status": balance_status,
+        "balance": balance,
+        "services_status": services_status,
+        "services": services,
+        "tickets_status": tickets_status,
+        "active_tickets": open_tickets,
+    }
+
+    logger.info(f"CUSTOMER_VALIDATED | idCustomer={id_customer} | openTickets={len(open_tickets)}")
+
+    return bot_message, result
+
+
+def handle_authenticated_message(message, customer):
+    text = str(message).lower()
+    id_customer = customer.get("idCustomer")
+
+    if "volver" in text or "menú" in text or "menu" in text:
+        clear_session_customer()
+        return (
+            "Volví al menú principal ✅\n\nPara iniciar de nuevo, escribe tu ID de cliente.",
+            {"mode": "main_menu_reset"},
+        )
+
+    if "tickets" in text or "ticket" in text:
+        tickets, status = get_tickets_by_customer(id_customer)
+        open_tickets = active_tickets(tickets)
+
+        return (
+            f"Tus tickets activos son:\n{summarize_tickets(open_tickets)}",
+            {
+                "mode": "show_active_tickets",
+                "tickets_status": status,
+                "active_tickets": open_tickets,
+            },
+        )
+
+    if "saldo" in text or "pago" in text:
+        balance, status = get_customer_balance(id_customer)
+        payment_value = balance.get("payment_status") if isinstance(balance, dict) else None
+        payment_label = payment_status_label(payment_value)
+
+        return (
+            f"Tu estado de pago aparece como: {payment_label}.\n\n"
+            "La API no expone un monto exacto de saldo en este ambiente, así que usamos payment_status como referencia.",
+            {
+                "mode": "show_balance",
+                "balance_status": status,
+                "balance": balance,
+            },
+        )
+
+    if "sí funcionó" in text or "si funciono" in text or "ya funcionó" in text or "ya funciona" in text:
+        record = save_local_modification(
+            "resolved_after_guidance",
+            message,
+            customer=customer,
+            extra={"resolution": "Cliente indica que las indicaciones básicas funcionaron."},
+        )
+
+        return (
+            "Perfecto ✅ Registré que el problema quedó solucionado después de las indicaciones básicas.\n\n"
+            "No modifiqué el dataset original; dejé evidencia local para seguimiento.",
+            {
+                "mode": "resolved_after_guidance",
+                "local_modification": record,
+            },
+        )
+
+    if "no funcionó" in text or "no funciono" in text or "sigue igual" in text or "no sirve" in text:
+        created = create_support_ticket(
+            id_customer,
+            "critical",
+            "Cliente indica que el diagnóstico básico no funcionó. Requiere revisión técnica.",
+        )
+
+        return (
+            "Entiendo. Como no funcionó la revisión básica, creé un ticket para soporte técnico ✅\n\n"
+            "Un integrante del equipo deberá revisar el caso.",
+            {
+                "mode": "created_ticket_after_failed_guidance",
+                "ticket_creation": created,
+            },
+        )
+
+    if any(keyword in text for keyword in CRITICAL_KEYWORDS):
+        created = create_support_ticket(
+            id_customer,
+            "critical",
+            f"Reporte crítico del cliente: {message}",
+        )
+
+        return (
+            "Por lo que describes, puede requerirse revisión técnica directa.\n\n"
+            "Creé un ticket de soporte técnico ✅",
+            {
+                "mode": "critical_created_ticket",
+                "ticket_creation": created,
+            },
+        )
+
+    if any(keyword in text for keyword in ADMIN_KEYWORDS):
+        created = create_support_ticket(
+            id_customer,
+            "administrative",
+            f"Solicitud administrativa del cliente: {message}",
+        )
+
+        return (
+            "Listo ✅ Creé un ticket para que soporte revise tu solicitud administrativa.",
+            {
+                "mode": "administrative_created_ticket",
+                "ticket_creation": created,
+            },
+        )
+
+    if any(keyword in text for keyword in REMOTE_KEYWORDS):
+        ping_result = run_ping_test("8.8.8.8", 4)
+
+        if ping_result.get("success"):
+            bot_message = (
+                "Parece un problema de lentitud o intermitencia.\n\n"
+                "Probemos primero:\n"
+                "1. Revisa que el módem esté encendido.\n"
+                "2. Reinícialo durante 30 segundos.\n"
+                "3. Espera a que las luces se estabilicen.\n\n"
+                "También ejecuté una prueba de conexión desde el agente y respondió correctamente.\n\n"
+                "Si esto no funcionó, escribe: no funcionó.\n"
+                "Si ya quedó, escribe: sí funcionó."
+            )
+        else:
+            bot_message = (
+                "Detecté un posible problema de conexión general desde el agente.\n\n"
+                "Si tu servicio sigue fallando, escribe: no funcionó."
+            )
+
+        logger.info(
+            f"PING_TEST | idCustomer={id_customer} | host=8.8.8.8 | success={ping_result.get('success')}"
+        )
+
+        return (
+            bot_message,
+            {
+                "mode": "remote_guidance",
+                "ping_test": ping_result,
+                "next_options": ["sí funcionó", "no funcionó", "volver al menú"],
+            },
+        )
+
+    classification = classify_free_text_problem(message)
+
+    bot_message = (
+        "Puedo ayudarte con soporte, pero necesito un poco más de contexto.\n\n"
+        "Describe si es falla de internet, luz roja, cable cortado, lentitud, pago o cambio de plan."
+    )
+
+    bot_message = use_ai_for_noncritical(
+        bot_message,
+        {
+            "mode": "authenticated_unclear",
+            "has_ticket": False,
+            "decision": classification.get("decision"),
+            "category": classification.get("category"),
+        },
+    )
+
+    return (
+        bot_message,
+        {
+            "mode": "authenticated_unclear",
+            "classification": classification,
+        },
+    )
+
+
+@app.route("/", methods=["GET"])
+def home():
+    clear_session_customer()
+    return render_template_string(
+        HTML,
+        user_message=None,
+        bot_message=None,
+        result=None,
+        show_menu=False,
+    )
+
+
+@app.route("/whatsapp", methods=["POST"])
+def whatsapp():
+    message = request.form.get("message", "").strip()
+
+    id_customer = extract_customer_id(message)
+
+    if id_customer:
+        bot_message, result = validate_customer_flow(id_customer)
+    else:
+        customer = read_session_customer()
+
+        if not customer:
+            bot_message = (
+                "Antes de continuar necesito validar tu cliente.\n\n"
+                "Escribe tu ID así:\ncliente 170"
+            )
+            result = {"mode": "requires_customer_validation"}
+        else:
+            bot_message, result = handle_authenticated_message(message, customer)
+
+    show_menu = should_show_menu(result)
+
+    return render_template_string(
+        HTML,
+        user_message=message,
+        bot_message=bot_message,
+        result=json.dumps(result, indent=4, ensure_ascii=False),
+        show_menu=show_menu,
+    )
+
+
+@app.route("/api/whatsapp", methods=["POST"])
+def api_whatsapp():
+    data = request.get_json() or {}
+    message = data.get("message", "").strip()
+
+    id_customer = extract_customer_id(message)
+
+    if id_customer:
+        bot_message, result = validate_customer_flow(id_customer)
+    else:
+        customer = read_session_customer()
+
+        if not customer:
+            bot_message = "Antes de continuar necesito validar tu cliente. Escribe: cliente 170"
+            result = {"mode": "requires_customer_validation"}
+        else:
+            bot_message, result = handle_authenticated_message(message, customer)
+
+    return jsonify(
+        {
+            "message": message,
+            "chatbot_message": bot_message,
+            "show_menu": should_show_menu(result),
+            "technical_detail": result,
+        }
+    )
+
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "ok", "service": "gns-whatsapp-chatbot"})
+
+
+@app.route("/api/summary", methods=["GET"])
+def api_summary():
+    categories, categories_status = get_categories()
+
+    return jsonify(
+        {
+            "service": "gns-whatsapp-chatbot",
+            "categories_status": categories_status,
+            "categories_available": len(categories) if isinstance(categories, list) else None,
+            "status": "summary_generated",
+        }
+    )
+
+
 if __name__ == "__main__":
-
     port = int(os.getenv("APP_PORT", 5000))
-
     app.run(host="0.0.0.0", port=port, debug=True)
-
